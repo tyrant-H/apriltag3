@@ -18,11 +18,18 @@ struct DetectorConfig {
     int decode_max_hamming = 5;
 };
 
+struct PipelineDebugImages {
+    cv::Mat gradient;
+    cv::Mat binary;
+    cv::Mat visualization;
+};
+
 class AprilTagDetector {
 public:
     explicit AprilTagDetector(DetectorConfig config = {});
-    std::vector<QuadCandidate> detect_quads_only(const cv::Mat& image) const;
-    std::vector<TagDetection> detect(const cv::Mat& image) const;
+    std::vector<QuadCandidate> detect_quads_only(const cv::Mat& image, PipelineDebugImages* debug = nullptr) const;
+    std::vector<TagDetection> detect(const cv::Mat& image, PipelineDebugImages* debug = nullptr) const;
+    cv::Mat draw_detections(const cv::Mat& image, const std::vector<TagDetection>& detections) const;
 
 private:
     DetectorConfig config_;

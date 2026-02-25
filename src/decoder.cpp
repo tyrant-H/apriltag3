@@ -4,40 +4,20 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <limits>
 #include <vector>
 
+#include <opencv2/aruco.hpp>
 #include <opencv2/core.hpp>
-
-#include "apriltag3_cpp/decode_core.h"
 
 namespace apriltag3_cpp {
 
 namespace {
-
-struct Codeword {
-    int id;
-    std::uint64_t code;
-};
-
-// Small internal codebook placeholder, while decode flow mirrors apriltag3 stages.
-constexpr std::array<Codeword, 8> kCodebook = {{
-    {0, 0x0000000f0f0f0f0fULL},
-    {1, 0x00000033cc33cc33ULL},
-    {2, 0x00000055aa55aa55ULL},
-    {3, 0x0000000ff00ff00fULL},
-    {4, 0x0000003c3c3c3c3cULL},
-    {5, 0x0000006996699669ULL},
-    {6, 0x0000005a5a5a5a5aULL},
-    {7, 0x00000066cc66cc66ULL},
-}};
 
 bool is_gray_u8(const cv::Mat& image) {
     return !image.empty() && image.type() == CV_8UC1;
 }
 
 cv::Matx33d homography_unit_to_quad(const QuadCandidate& quad) {
-    // Maps unit square corners (0,0),(1,0),(1,1),(0,1) -> quad corners.
     cv::Mat A(8, 8, CV_64F, cv::Scalar(0));
     cv::Mat b(8, 1, CV_64F, cv::Scalar(0));
 
@@ -88,7 +68,11 @@ int sample_pixel(const cv::Mat& gray, const cv::Matx33d& H, double x, double y) 
     return static_cast<int>(gray.ptr<std::uint8_t>(v)[u]);
 }
 
-TagDetection decode_one(const cv::Mat& gray, const QuadCandidate& quad, const DecoderConfig& config) {
+TagDetection decode_one(
+    const cv::Mat& gray,
+    const QuadCandidate& quad,
+    const DecoderConfig& config,
+    const cv::Ptr<cv::aruco::Dictionary>& family36h11) {
     TagDetection det;
     det.area = quad.area;
     for (int i = 0; i < 4; ++i) {
@@ -98,14 +82,13 @@ TagDetection decode_one(const cv::Mat& gray, const QuadCandidate& quad, const De
     const int d = config.tag_data_size;
     const int border = config.black_border;
     const int total = d + 2 * border;
-    if (d <= 0 || total <= 0 || d * d > 63) {
+    if (d <= 0 || total <= 0 || d != 6 || border < 1) {
         return det;
     }
 
     const cv::Matx33d H = homography_unit_to_quad(quad);
 
     std::vector<int> sampled(static_cast<std::size_t>(total * total), 0);
-    sampled.reserve(static_cast<std::size_t>(total * total));
     for (int gy = 0; gy < total; ++gy) {
         for (int gx = 0; gx < total; ++gx) {
             const double x = (static_cast<double>(gx) + 0.5) / static_cast<double>(total);
@@ -114,7 +97,6 @@ TagDetection decode_one(const cv::Mat& gray, const QuadCandidate& quad, const De
         }
     }
 
-    // apriltag-style decode step: use border model to derive threshold.
     int border_sum = 0;
     int border_count = 0;
     int inner_sum = 0;
@@ -137,34 +119,26 @@ TagDetection decode_one(const cv::Mat& gray, const QuadCandidate& quad, const De
     const int inner_mean = inner_count > 0 ? inner_sum / inner_count : border_mean;
     const int threshold = (border_mean + inner_mean) / 2;
 
-    std::uint64_t observed = 0;
-    int bit = 0;
-    for (int gy = border; gy < total - border; ++gy) {
-        for (int gx = border; gx < total - border; ++gx) {
-            const int v = sampled[static_cast<std::size_t>(gy * total + gx)];
-            if (v > threshold) {
-                observed |= (1ULL << bit);
-            }
-            ++bit;
+    cv::Mat bits(d, d, CV_8UC1, cv::Scalar(0));
+    int ones = 0;
+    for (int gy = 0; gy < d; ++gy) {
+        std::uint8_t* row = bits.ptr<std::uint8_t>(gy);
+        for (int gx = 0; gx < d; ++gx) {
+            const int v = sampled[static_cast<std::size_t>((gy + border) * total + (gx + border))];
+            row[gx] = (v > threshold) ? 1 : 0;
+            ones += row[gx];
         }
     }
 
-    int best_id = -1;
-    int best_hamming = std::numeric_limits<int>::max();
-    int best_rotation = 0;
-    apriltag3_cpp_best_codeword_match(
-        observed,
-        d,
-        reinterpret_cast<const apriltag3_cpp_codeword*>(kCodebook.data()),
-        static_cast<int>(kCodebook.size()),
-        &best_id,
-        &best_hamming,
-        &best_rotation);
+    int id = -1;
+    int rotation = 0;
+    const double max_correction_rate = static_cast<double>(config.max_hamming) / static_cast<double>(d * d);
+    const bool found = family36h11->identify(bits, id, rotation, max_correction_rate);
 
-    det.id = (best_hamming <= config.max_hamming) ? best_id : -1;
-    det.hamming = best_hamming;
-    det.rotation = best_rotation;
-    det.decision_margin = static_cast<float>((d * d) - best_hamming);
+    det.id = found ? id : -1;
+    det.rotation = found ? rotation : 0;
+    det.hamming = found ? family36h11->getDistanceToId(bits, id, true) : (d * d);
+    det.decision_margin = static_cast<float>(std::abs((d * d) - 2 * ones));
     return det;
 }
 
@@ -179,9 +153,13 @@ std::vector<TagDetection> decode_quads(
         return detections;
     }
 
+    // Full AprilTag 36h11 tag family from OpenCV predefined dictionary.
+    const cv::Ptr<cv::aruco::Dictionary> family36h11 =
+        cv::aruco::getPredefinedDictionary(cv::aruco::DICT_APRILTAG_36h11);
+
     detections.reserve(quads.size());
     for (const QuadCandidate& quad : quads) {
-        detections.push_back(decode_one(gray, quad, config));
+        detections.push_back(decode_one(gray, quad, config, family36h11));
     }
     return detections;
 }
